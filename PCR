@@ -533,7 +533,7 @@ def format_report(res: dict, origin: tuple[float, float] | None = None, airfield
     nats_data_url = "https://nats-uk.ead-it.com/cms-nats/opencms/en/Publications/digital-datasets/"
 
     lines.append("")
-    lines.append("  TARGET MAPPING")
+    lines.append("  AOI MAPPING")
     lines.append("")
     lines.append(f"  > Google Maps | {format_link('https://www.google.com/maps', gmaps_url)}")
     lines.append(f"  > Mapillary   | {format_link('https://www.mapillary.com/', mapillary_url)}")
