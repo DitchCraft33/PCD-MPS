@@ -1,8 +1,8 @@
-# SGL TGT ... POST CODE | python3 pcr.py
-# MLT TGT ... python3 pcr.py "POST CODE" "sw1a 1aa"
+# SGL AOI ... POST CODE | python3 pcr.py
+# MLT AOI ... python3 pcr.py "POST CODE" "sw1a 1aa"
 # FRM ORG ... python3 pcr.py "POST CODE" --from 34.3742,-3.2350
 # AFL CNT ... python3 pcr.py "POST CODE" --airfields 3
-# INT TGT ... python3 pcr.py
+# INT AOI ... python3 pcr.py
 
 import csv
 import math
