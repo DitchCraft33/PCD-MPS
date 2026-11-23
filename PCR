@@ -479,7 +479,7 @@ def format_report(res: dict, origin: tuple[float, float] | None = None, airfield
 
     lines = [
         "",
-        f"  TGT AO {pc} W '{ward}' P '{parish}' D '{district}' PFA '{pfa}'",
+        f"  AOI {pc} W '{ward}' P '{parish}' D '{district}' PFA '{pfa}'",
         "",
         f"  > LAT LNG : {lat:.6f} {lon:.6f}",
         f"  > BNG E+N : {eastings} {northings}",
