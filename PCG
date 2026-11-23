@@ -1,0 +1,463 @@
+# SGL TGT ... echo "ts17 0lu" | python3 pcg.py
+# GD > PC ... echo "NZ 45371 15165" | python3 pcg.py
+# LL > PC ... echo "54.529753,-1.300446" | python3 pcg.py
+# CLI ARG ... python3 pcg.py "ts17 0lu" "NZ 453 151" "54.529753,-1.300446"
+# JSON DB ... python3 pcg.py --json /path/to/postcodes.json.gz "ts17 0lu"
+# INT MDE ... python3 pcg.py
+
+import gzip
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+DEFAULT_JSON_PATHS = [
+    Path.cwd() / "postcodes.json",
+    Path.cwd() / "postcodes.json.gz",
+    Path.home() / ".cache" / "ditchcraft_recce" / "postcodes.json",
+    Path.home() / ".cache" / "ditchcraft_recce" / "postcodes.json.gz",
+]
+
+POSTCODE_RE = re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$", re.I)
+GRID_RE = re.compile(r"^([A-Z]{2})\s*(\d{1,5})\s*(\d{1,5})$", re.I)
+GRID_COMPACT_RE = re.compile(r"^([A-Z]{2})\s*(\d{2}|\d{4}|\d{6}|\d{8}|\d{10})$", re.I)
+LATLON_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*[, ]\s*([+-]?\d+(?:\.\d+)?)\s*$")
+
+OS_5X5 = [
+    ["A", "B", "C", "D", "E"],
+    ["F", "G", "H", "J", "K"],
+    ["L", "M", "N", "O", "P"],
+    ["Q", "R", "S", "T", "U"],
+    ["V", "W", "X", "Y", "Z"],
+]
+OS_SUPER = {
+    (0, 0): "S", (1, 0): "T",
+    (0, 1): "N", (1, 1): "O",
+    (0, 2): "H", (1, 2): "J",
+}
+OS_SQ_TO_OFFSET: dict[str, tuple[int, int]] = {}
+for _sy, (_scol, _srow) in enumerate([(0, 0), (1, 0), (0, 1), (1, 1), (0, 2), (1, 2)]):
+    _slet = OS_SUPER[(_scol, _srow)]
+    for _r_idx, _row in enumerate(OS_5X5):
+        _n_sub = 4 - _r_idx
+        for _e_idx, _let in enumerate(_row):
+            _e_100k = _scol * 5 + _e_idx
+            _n_100k = _srow * 5 + _n_sub
+            OS_SQ_TO_OFFSET[f"{_slet}{_let}"] = (_e_100k * 100_000, _n_100k * 100_000)
+
+
+def normalise_postcode(raw: str) -> str:
+    cleaned = re.sub(r"\s+", "", raw.strip().upper())
+    if len(cleaned) < 5 or not POSTCODE_RE.match(cleaned):
+        raise ValueError(f"Invalid UK postcode: '{raw}'")
+    return f"{cleaned[:-3]} {cleaned[-3:]}"
+
+
+def parse_latlon(raw: str) -> tuple[float, float] | None:
+    m = LATLON_RE.match(raw)
+    if not m:
+        return None
+    lat = float(m.group(1))
+    lon = float(m.group(2))
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        raise ValueError(f"Coordinate out of range (lat -90..90, lon -180..180): '{raw}'")
+    return lat, lon
+
+
+def latlon_to_bng(lat: float, lon: float) -> tuple[float, float]:
+    lat_r = math.radians(lat)
+    lon_r = math.radians(lon)
+
+    a = 6377563.396
+    b = 6356256.909
+    f0 = 0.9996012717
+    lat0 = math.radians(49.0)
+    lon0 = math.radians(-2.0)
+    n0 = -100000.0
+    e0 = 400000.0
+
+    lat_r += math.radians(0.0005)
+    lon_r += math.radians(0.0016)
+
+    e2 = (a * a - b * b) / (a * a)
+    n = (a - b) / (a + b)
+
+    sin_lat = math.sin(lat_r)
+    cos_lat = math.cos(lat_r)
+    tan_lat = math.tan(lat_r)
+
+    nu = a * f0 / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
+    rho = a * f0 * (1.0 - e2) / ((1.0 - e2 * sin_lat * sin_lat) ** 1.5)
+    eta2 = nu / rho - 1.0
+
+    dlat = lat_r - lat0
+    dlon = lon_r - lon0
+
+    m = (
+        b
+        * f0
+        * (
+            (1.0 + n + (5.0 / 4.0) * n * n + (5.0 / 4.0) * n * n * n) * dlat
+            - (3.0 * n + 3.0 * n * n + (21.0 / 8.0) * n * n * n)
+            * math.sin(dlat)
+            * math.cos(lat_r + lat0)
+            + ((15.0 / 8.0) * n * n + (15.0 / 8.0) * n * n * n)
+            * math.sin(2.0 * dlat)
+            * math.cos(2.0 * (lat_r + lat0))
+            - (35.0 / 24.0) * n * n * n * math.sin(3.0 * dlat) * math.cos(3.0 * (lat_r + lat0))
+        )
+    )
+
+    i = m + n0
+    ii = (nu / 2.0) * sin_lat * cos_lat
+    iii = (nu / 24.0) * sin_lat * (cos_lat**3) * (5.0 - tan_lat**2 + 9.0 * eta2)
+    iiia = (nu / 720.0) * sin_lat * (cos_lat**5) * (61.0 - 58.0 * tan_lat**2 + tan_lat**4)
+    iv = nu * cos_lat
+    v = (nu / 6.0) * (cos_lat**3) * (nu / rho - tan_lat**2)
+    vi = (nu / 120.0) * (cos_lat**5) * (
+        5.0 - 18.0 * tan_lat**2 + tan_lat**4 + 14.0 * eta2 - 58.0 * (tan_lat**2) * eta2
+    )
+
+    northing = i + ii * (dlon**2) + iii * (dlon**4) + iiia * (dlon**6)
+    easting = e0 + iv * dlon + v * (dlon**3) + vi * (dlon**5)
+    return easting, northing
+
+
+def bng_to_latlon(easting: float, northing: float) -> tuple[float, float]:
+    a = 6377563.396
+    b = 6356256.909
+    f0 = 0.9996012717
+    lat0 = math.radians(49.0)
+    lon0 = math.radians(-2.0)
+    n0 = -100000.0
+    e0 = 400000.0
+    e2 = (a * a - b * b) / (a * a)
+    n = (a - b) / (a + b)
+
+    lat_p = lat0
+    m = 0.0
+    while True:
+        lat_p = (northing - n0 - m) / (a * f0) + lat_p
+        m = (
+            b
+            * f0
+            * (
+                (1.0 + n + (5.0 / 4.0) * n * n + (5.0 / 4.0) * n * n * n) * (lat_p - lat0)
+                - (3.0 * n + 3.0 * n * n + (21.0 / 8.0) * n * n * n)
+                * math.sin(lat_p - lat0)
+                * math.cos(lat_p + lat0)
+                + ((15.0 / 8.0) * n * n + (15.0 / 8.0) * n * n * n)
+                * math.sin(2.0 * (lat_p - lat0))
+                * math.cos(2.0 * (lat_p + lat0))
+                - (35.0 / 24.0)
+                * n
+                * n
+                * n
+                * math.sin(3.0 * (lat_p - lat0))
+                * math.cos(3.0 * (lat_p + lat0))
+            )
+        )
+        if abs(northing - n0 - m) < 0.01:
+            break
+
+    sin_lat = math.sin(lat_p)
+    cos_lat = math.cos(lat_p)
+    tan_lat = math.tan(lat_p)
+    nu = a * f0 / math.sqrt(1.0 - e2 * sin_lat * sin_lat)
+    rho = a * f0 * (1.0 - e2) / ((1.0 - e2 * sin_lat * sin_lat) ** 1.5)
+    eta2 = nu / rho - 1.0
+
+    vii = tan_lat / (2.0 * rho * nu)
+    viii = (tan_lat / (24.0 * rho * (nu**3))) * (5.0 + 3.0 * tan_lat**2 + eta2 - 9.0 * (tan_lat**2) * eta2)
+    ix = (tan_lat / (720.0 * rho * (nu**5))) * (61.0 + 90.0 * tan_lat**2 + 45.0 * tan_lat**4)
+    x = 1.0 / (cos_lat * nu)
+    xi = (1.0 / (6.0 * cos_lat * (nu**3))) * (nu / rho + 2.0 * tan_lat**2)
+    xii = (1.0 / (120.0 * cos_lat * (nu**5))) * (5.0 + 28.0 * tan_lat**2 + 24.0 * tan_lat**4)
+    xiia = (1.0 / (5040.0 * cos_lat * (nu**7))) * (
+        61.0 + 662.0 * tan_lat**2 + 1320.0 * tan_lat**4 + 720.0 * tan_lat**6
+    )
+
+    de = easting - e0
+    lat_os = lat_p - vii * (de**2) + viii * (de**4) - ix * (de**6)
+    lon_os = lon0 + x * de - xi * (de**3) + xii * (de**5) - xiia * (de**7)
+
+    lat_wgs = math.degrees(lat_os) - 0.0005
+    lon_wgs = math.degrees(lon_os) - 0.0016
+    return lat_wgs, lon_wgs
+
+
+def bng_to_os_grid(eastings: float, northings: float, digits: int = 10) -> str | None:
+    if eastings is None or northings is None or eastings < 0 or northings < 0:
+        return None
+    e100k = int(eastings // 100_000)
+    n100k = int(northings // 100_000)
+    super_let = OS_SUPER.get((e100k // 5, n100k // 5))
+    if not super_let:
+        return None
+    row_from_top = 4 - (n100k % 5)
+    col = e100k % 5
+    sq = f"{super_let}{OS_5X5[row_from_top][col]}"
+
+    half = max(1, min(5, digits // 2))
+    scale = 10 ** (5 - half)
+    e_str = str(int((eastings % 100_000) // scale)).zfill(half)
+    n_str = str(int((northings % 100_000) // scale)).zfill(half)
+    return f"{sq} {e_str} {n_str}"
+
+
+def os_grid_to_bng(raw_grid: str) -> tuple[float, float, str]:
+    s = raw_grid.strip().upper()
+    m = GRID_RE.match(s)
+    if m:
+        sq, e_part, n_part = m.group(1), m.group(2), m.group(3)
+        if len(e_part) != len(n_part):
+            raise ValueError(f"Mismatched east/north digit lengths in grid ref: '{raw_grid}'")
+        digits_per_axis = len(e_part)
+    else:
+        mc = GRID_COMPACT_RE.match(re.sub(r"\s+", "", s))
+        if not mc:
+            raise ValueError(f"Invalid OS grid reference: '{raw_grid}'")
+        sq = mc.group(1)
+        nums = mc.group(2)
+        digits_per_axis = len(nums) // 2
+        e_part = nums[:digits_per_axis]
+        n_part = nums[digits_per_axis:]
+
+    if digits_per_axis > 5:
+        raise ValueError(f"Grid precision too high (max 10 figures): '{raw_grid}'")
+
+    if sq not in OS_SQ_TO_OFFSET:
+        raise ValueError(f"Unknown OS grid square: '{sq}'")
+
+    base_e, base_n = OS_SQ_TO_OFFSET[sq]
+    unit = 10 ** (5 - digits_per_axis)
+    easting = base_e + int(e_part) * unit + (unit / 2.0)
+    northing = base_n + int(n_part) * unit + (unit / 2.0)
+    formatted = f"{sq} {e_part} {n_part}"
+    return easting, northing, formatted
+
+
+def resolve_json_path(explicit_path: str | None) -> Path:
+    if explicit_path:
+        p = Path(explicit_path).expanduser()
+        if not p.exists():
+            raise FileNotFoundError(f"Local JSON file not found: {p}")
+        return p
+    for candidate in DEFAULT_JSON_PATHS:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "No local postcodes.json or postcodes.json.gz found. Pass --json /path/to/file.json[.gz] or place it in ./ or ~/.cache/ditchcraft_recce/"
+    )
+
+
+def _first_present(row: dict, keys: list[str]):
+    for key in keys:
+        if key in row and row[key] is not None and row[key] != "":
+            return row[key]
+    return None
+
+
+def load_postcode_index(json_path: Path) -> tuple[dict[str, dict], list[dict]]:
+    opener = gzip.open if json_path.suffix == ".gz" else open
+    with opener(json_path, "rt", encoding="utf-8") as f:
+        raw_data = json.load(f)
+
+    if isinstance(raw_data, dict):
+        iterator = [{"postcode": k, **(v if isinstance(v, dict) else {})} for k, v in raw_data.items()]
+    elif isinstance(raw_data, list):
+        iterator = [row for row in raw_data if isinstance(row, dict)]
+    else:
+        raise ValueError("Unsupported JSON root structure; expected a list or object.")
+
+    by_pc: dict[str, dict] = {}
+    spatial_rows: list[dict] = []
+
+    for row in iterator:
+        pc_raw = _first_present(row, ["postcode", "pc", "Postcode", "pcds"])
+        if not pc_raw:
+            continue
+        pc_norm = re.sub(r"\s+", "", str(pc_raw).upper())
+        pc_disp = f"{pc_norm[:-3]} {pc_norm[-3:]}" if len(pc_norm) >= 5 else str(pc_raw).upper()
+
+        lat_raw = _first_present(row, ["lat", "latitude", "Latitude"])
+        lon_raw = _first_present(row, ["lon", "lng", "longitude", "Longitude"])
+        e_raw = _first_present(row, ["eastings", "easting", "Eastings"])
+        n_raw = _first_present(row, ["northings", "northing", "Northings"])
+        grid_val = _first_present(row, ["grid", "os_grid", "grid_ref"])
+
+        lat = float(lat_raw) if lat_raw is not None else None
+        lon = float(lon_raw) if lon_raw is not None else None
+        eastings = float(e_raw) if e_raw is not None else None
+        northings = float(n_raw) if n_raw is not None else None
+
+        if (eastings is None or northings is None) and lat is not None and lon is not None:
+            eastings, northings = latlon_to_bng(lat, lon)
+        elif (lat is None or lon is None) and eastings is not None and northings is not None:
+            lat, lon = bng_to_latlon(eastings, northings)
+
+        record = {
+            "postcode": pc_disp,
+            "lat": lat,
+            "lon": lon,
+            "eastings": eastings,
+            "northings": northings,
+            "grid": str(grid_val).strip() if grid_val else None,
+        }
+        by_pc[pc_norm] = record
+        if eastings is not None and northings is not None:
+            spatial_rows.append(record)
+
+    return by_pc, spatial_rows
+
+
+def _nearest_from_bng(header: str, easting: float, northing: float, spatial_rows: list[dict], top_n: int) -> str:
+    if not spatial_rows:
+        return f"\n  {header}\n\n  > [!] No spatial coordinates available in local JSON for reverse lookup."
+
+    scored = []
+    for row in spatial_rows:
+        dist_m = math.hypot(row["eastings"] - easting, row["northings"] - northing)
+        scored.append((dist_m, row))
+    scored.sort(key=lambda item: item[0])
+
+    lines = ["", header, ""]
+    for dist_m, row in scored[:top_n]:
+        ll = f"{row['lat']:.6f} {row['lon']:.6f}" if row["lat"] is not None and row["lon"] is not None else "N/A"
+        lines.append(
+            f"  > {row['postcode']:8s} | {dist_m:7.1f} m | {ll}"
+        )
+    return "\n".join(lines)
+
+
+def query_target(query: str, by_pc: dict[str, dict], spatial_rows: list[dict], top_n: int = 5) -> str:
+    q = query.strip()
+    compact = re.sub(r"\s+", "", q.upper())
+
+    if POSTCODE_RE.match(compact):
+        pc_disp = normalise_postcode(q)
+        rec = by_pc.get(compact)
+        if not rec:
+            return f"\n  > [!] Postcode not found in local JSON: {pc_disp}"
+
+        lat, lon = rec["lat"], rec["lon"]
+        e, n = rec["eastings"], rec["northings"]
+        latlon_str = f"{lat:.6f} {lon:.6f}" if lat is not None and lon is not None else "N/A"
+        g10 = bng_to_os_grid(e, n, 10) if e is not None and n is not None else "N/A"
+        g6 = rec["grid"] or (bng_to_os_grid(e, n, 6) if e is not None and n is not None else "N/A")
+
+        return "\n".join([
+            "",
+            f"  > (P)CODE : {pc_disp}",
+            f"  > LAT LNG : {latlon_str}",
+            f"  > OS GRID : {g10}  ( {g6} )",
+        ])
+
+    latlon = parse_latlon(q)
+    if latlon is not None:
+        lat, lon = latlon
+        easting, northing = latlon_to_bng(lat, lon)
+        return _nearest_from_bng(f"  LAT LNG >> (P)CODE  ...  {lat:.6f} {lon:.6f}", easting, northing, spatial_rows, top_n)
+
+    easting, northing, fmt_grid = os_grid_to_bng(q)
+    return _nearest_from_bng(f"  OS GRID REF >> (P)CODE  ...  {fmt_grid}", easting, northing, spatial_rows, top_n)
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    json_arg = None
+    top_n = 5
+
+    if "--json" in args:
+        idx = args.index("--json")
+        if idx + 1 >= len(args):
+            print("Usage: python3 pcg.py [--json FILE] [--top N] [QUERY...]", file=sys.stderr)
+            sys.exit(1)
+        json_arg = args[idx + 1]
+        del args[idx : idx + 2]
+
+    if "--top" in args:
+        idx = args.index("--top")
+        if idx + 1 >= len(args):
+            print("Usage: python3 pcg.py [--json FILE] [--top N] [QUERY...]", file=sys.stderr)
+            sys.exit(1)
+        top_n = int(args[idx + 1])
+        del args[idx : idx + 2]
+
+    try:
+        json_path = resolve_json_path(json_arg)
+        by_pc, spatial_rows = load_postcode_index(json_path)
+    except Exception as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if args:
+        merged: list[str] = []
+        i = 0
+        while i < len(args):
+            cur = args[i].strip()
+            if (
+                i + 1 < len(args)
+                and re.match(r"^[A-Z]{1,2}\d[A-Z\d]?$", cur, re.I)
+                and re.match(r"^\d[A-Z]{2}$", args[i + 1].strip(), re.I)
+            ):
+                merged.append(f"{cur} {args[i + 1].strip()}")
+                i += 2
+            elif (
+                i + 2 < len(args)
+                and re.match(r"^[A-Z]{2}$", cur, re.I)
+                and args[i + 1].strip().isdigit()
+                and args[i + 2].strip().isdigit()
+            ):
+                merged.append(f"{cur} {args[i + 1].strip()} {args[i + 2].strip()}")
+                i += 3
+            elif (
+                i + 1 < len(args)
+                and re.match(r"^[+-]?\d+(?:\.\d+)?,$", cur)
+                and re.match(r"^[+-]?\d+(?:\.\d+)?$", args[i + 1].strip())
+            ):
+                merged.append(f"{cur}{args[i + 1].strip()}")
+                i += 2
+            else:
+                merged.append(cur)
+                i += 1
+
+        for item in merged:
+            try:
+                print(query_target(item, by_pc, spatial_rows, top_n=top_n))
+            except Exception as exc:
+                print(f"[!] {exc}", file=sys.stderr)
+        print()
+        return
+
+    if not sys.stdin.isatty():
+        for line in sys.stdin:
+            raw = line.strip()
+            if not raw or raw.lower() in {"e", "q", "quit", "exit"}:
+                continue
+            try:
+                print(query_target(raw, by_pc, spatial_rows, top_n=top_n))
+            except Exception as exc:
+                print(f"[!] {exc}", file=sys.stderr)
+        print()
+        return
+
+    while True:
+        try:
+            raw = input("\n   > PCODE , GD , LAT LNG , ( E )XIT  :  ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not raw:
+            continue
+        if raw.lower() in {"e", "q", "quit", "exit"}:
+            break
+        try:
+            print(query_target(raw, by_pc, spatial_rows, top_n=top_n))
+        except Exception as exc:
+            print(f"  [!] {exc}")
+
+
+if __name__ == "__main__":
+    main()

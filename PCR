@@ -1,0 +1,650 @@
+# SGL TGT ... POST CODE | python3 pcr.py
+# MLT TGT ... python3 pcr.py "POST CODE" "sw1a 1aa"
+# FRM ORG ... python3 pcr.py "POST CODE" --from 34.3742,-3.2350
+# AFL CNT ... python3 pcr.py "POST CODE" --airfields 3
+# INT TGT ... python3 pcr.py
+
+import csv
+import math
+import os
+import re
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+import requests
+
+POSTCODE_RE = re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?\s*\d[A-Z]{2}$", re.I)
+OUTWARD_RE = re.compile(r"^[A-Z]{1,2}\d[A-Z\d]?$", re.I)
+INWARD_RE = re.compile(r"^\d[A-Z]{2}$", re.I)
+AIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
+CACHE_DIR = Path.home() / ".cache" / "ditchcraft_recce"
+AIRPORTS_CACHE = CACHE_DIR / "uk_airports.csv"
+
+OVERPASS_U_QUERY = """[out:json][timeout:25];
+(
+  // Power lines, poles, and towers
+  way["power"="line"]({{bbox}});
+  way["power"="minor_line"]({{bbox}});
+  node["power"="tower"]({{bbox}});
+  node["power"="pole"]({{bbox}});
+
+  // Electrical substations (mapped as points, polygons, or multipolygons)
+  nwr["power"="substation"]({{bbox}});
+
+  // Masts, communication towers, and wind turbines
+  nwr["man_made"="mast"]({{bbox}});
+  nwr["man_made"="tower"]({{bbox}});
+  nwr["generator:source"="wind"]({{bbox}});
+
+  // Telecom infrastructure (exchanges, data centres, street cabinets, antennas)
+  nwr["telecom"]({{bbox}});
+  nwr["man_made"="communications_tower"]({{bbox}});
+  nwr["man_made"="antenna"]({{bbox}});
+  way["telecom"="line"]({{bbox}});
+);
+out body;
+>;
+out skel qt;"""
+
+OVERPASS_C_QUERY = """[out:json][timeout:30];
+(
+  // 1. Explicit ANPR / ALPR and traffic-zone surveillance cameras
+  nwr["man_made"="surveillance"]["surveillance:type"~"ALPR|ANPR"]({{bbox}});
+  nwr["man_made"="surveillance"]["surveillance:zone"~"traffic|highway|motorway"]({{bbox}});
+
+  // 2. Pole-mounted & street-light cameras (often unlabelled ANPR / council CCTV)
+  nwr["man_made"="surveillance"]["camera:mount"~"pole|street_lamp|traffic_signals"]({{bbox}});
+  nwr["man_made"="surveillance"]["surveillance"="outdoor"]({{bbox}});
+
+  // 3. Motorway & A-road overhead gantries + enforcement zones
+  nwr["highway"="gantry"]({{bbox}});
+  nwr["man_made"="gantry"]({{bbox}});
+  nwr["enforcement"~"average_speed|speed|traffic_signals|access"]({{bbox}});
+  node["highway"="speed_camera"]({{bbox}});
+
+  // 4. UK-specific surveillance & ANPR operators
+  nwr["man_made"="surveillance"]["operator"~"Police|Constabulary|National Highways|Highways England|Transport for|Council|ParkingEye",i]({{bbox}});
+
+  // 5. Mobile camera van lay-bys & elevated observation points
+  nwr["highway"="services"]({{bbox}});
+  nwr["amenity"="parking"]["parking"="layby"]({{bbox}});
+  way["highway"="rest_area"]({{bbox}});
+  nwr["man_made"="monitoring_station"]({{bbox}});
+
+  // 6. Police stations, compounds, and operational bases
+  nwr["amenity"="police"]({{bbox}});
+  nwr["landuse"="military"]({{bbox}});
+);
+out body;
+>;
+out skel qt;"""
+
+OS_5X5 = [
+    ["A", "B", "C", "D", "E"],
+    ["F", "G", "H", "J", "K"],
+    ["L", "M", "N", "O", "P"],
+    ["Q", "R", "S", "T", "U"],
+    ["V", "W", "X", "Y", "Z"],
+]
+OS_SUPER = {
+    (0, 0): "S", (1, 0): "T",
+    (0, 1): "N", (1, 1): "O",
+    (0, 2): "H", (1, 2): "J",
+}
+
+GEOHASH_32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+OLC_ALPHABET = "23456789CFGHJMPQRVWX"
+MGRS_100K_ALPHA = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+MGRS_100K_V = "ABCDEFGHJKLMNPQRSTUV"
+
+
+def clear_screen() -> None:
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+
+def format_link(label: str, url: str) -> str:
+    if sys.stdout.isatty():
+        return f"\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\"
+    return label
+
+
+def normalise_postcode(raw: str) -> str:
+    cleaned = re.sub(r"\s+", "", raw.strip().upper())
+    if len(cleaned) < 5 or not POSTCODE_RE.match(cleaned):
+        raise ValueError(f"Invalid UK Postcode Format : '{raw}'")
+    return f"{cleaned[:-3]} {cleaned[-3:]}"
+
+
+def parse_cli_postcodes(tokens: list[str]) -> list[str]:
+    targets: list[str] = []
+    i = 0
+    while i < len(tokens):
+        cur = tokens[i].strip()
+        if (
+            i + 1 < len(tokens)
+            and OUTWARD_RE.match(cur)
+            and INWARD_RE.match(tokens[i + 1].strip())
+        ):
+            targets.append(f"{cur} {tokens[i + 1].strip()}")
+            i += 2
+        else:
+            targets.append(cur)
+            i += 1
+    return targets
+
+
+def lookup_postcode(postcode: str) -> dict:
+    url = f"https://api.postcodes.io/postcodes/{requests.utils.quote(postcode)}"
+    resp = requests.get(url, timeout=8)
+    data = resp.json()
+    if resp.status_code != 200 or data.get("status") != 200:
+        raise RuntimeError(data.get("error", f"Postcode Lookup Failed ...  ({resp.status_code})"))
+    return data["result"]
+
+
+def lookup_elevation(lat: float, lon: float) -> float | None:
+    try:
+        r = requests.get(
+            "https://api.open-meteo.com/v1/elevation",
+            params={"latitude": lat, "longitude": lon},
+            timeout=6,
+        )
+        elev = r.json().get("elevation")
+        if isinstance(elev, list) and elev:
+            return float(elev[0])
+        if isinstance(elev, (int, float)):
+            return float(elev)
+    except Exception:
+        pass
+    return None
+
+
+def lookup_w3w(lat: float, lon: float) -> str:
+    api_key = os.environ.get("W3W_API_KEY", "").strip()
+    if not api_key:
+        return "Key Required ( set W3W_API_KEY )"
+    try:
+        r = requests.get(
+            "https://api.what3words.com/v3/convert-to-3wa",
+            params={"coordinates": f"{lat:.6f},{lon:.6f}", "key": api_key},
+            timeout=6,
+        )
+        if r.status_code == 200:
+            words = r.json().get("words")
+            if words:
+                return f"///{words}"
+    except Exception:
+        pass
+    return "Lookup Failed"
+
+
+def bng_to_os_grid(eastings: int | None, northings: int | None, digits: int = 10) -> str | None:
+    if eastings is None or northings is None or eastings < 0 or northings < 0:
+        return None
+    e100k = int(eastings // 100_000)
+    n100k = int(northings // 100_000)
+    super_let = OS_SUPER.get((e100k // 5, n100k // 5))
+    if not super_let:
+        return None
+    row_from_top = 4 - (n100k % 5)
+    col = e100k % 5
+    sq = f"{super_let}{OS_5X5[row_from_top][col]}"
+
+    half = max(1, min(5, digits // 2))
+    scale = 10 ** (5 - half)
+    e_str = str(int((eastings % 100_000) // scale)).zfill(half)
+    n_str = str(int((northings % 100_000) // scale)).zfill(half)
+    return f"{sq} {e_str} {n_str}"
+
+
+def latlon_to_utm(lat: float, lon: float) -> tuple[int, str, float, float]:
+    a = 6378137.0
+    f = 1 / 298.257223563
+    k0 = 0.9996
+    e2 = f * (2 - f)
+    ep2 = e2 / (1 - e2)
+
+    zone = int((lon + 180) // 6) + 1
+    if 56.0 <= lat < 64.0 and 3.0 <= lon < 12.0:
+        zone = 32
+    elif 72.0 <= lat <= 84.0:
+        if 0.0 <= lon < 9.0:
+            zone = 31
+        elif 9.0 <= lon < 21.0:
+            zone = 33
+        elif 21.0 <= lon < 33.0:
+            zone = 35
+        elif 33.0 <= lon < 42.0:
+            zone = 37
+
+    lat_rad = math.radians(lat)
+    lon_rad = math.radians(lon)
+    lon0_rad = math.radians((zone - 1) * 6 - 180 + 3)
+
+    n = a / math.sqrt(1 - e2 * math.sin(lat_rad) ** 2)
+    t = math.tan(lat_rad) ** 2
+    c = ep2 * math.cos(lat_rad) ** 2
+    dlon = lon_rad - lon0_rad
+
+    m = a * (
+        (1 - e2 / 4 - 3 * e2**2 / 64 - 5 * e2**3 / 256) * lat_rad
+        - (3 * e2 / 8 + 3 * e2**2 / 32 + 45 * e2**3 / 1024) * math.sin(2 * lat_rad)
+        + (15 * e2**2 / 256 + 45 * e2**3 / 1024) * math.sin(4 * lat_rad)
+        - (35 * e2**3 / 3072) * math.sin(6 * lat_rad)
+    )
+
+    cos_lat = math.cos(lat_rad)
+    sin_lat = math.sin(lat_rad)
+    tan_lat = math.tan(lat_rad)
+
+    easting = (
+        k0
+        * n
+        * (
+            dlon * cos_lat
+            + (dlon**3 * cos_lat**3 / 6) * (1 - t + c)
+            + (dlon**5 * cos_lat**5 / 120) * (5 - 18 * t + t**2 + 72 * c - 58 * ep2)
+        )
+        + 500_000.0
+    )
+
+    northing = k0 * (
+        m
+        + n
+        * tan_lat
+        * (
+            (dlon**2 * cos_lat**2 / 2)
+            + (dlon**4 * cos_lat**4 / 24) * (5 - t + 9 * c + 4 * c**2)
+            + (dlon**6 * cos_lat**6 / 720) * (61 - 58 * t + t**2 + 600 * c - 330 * ep2)
+        )
+    )
+    hemi = "N" if lat >= 0 else "S"
+    if lat < 0:
+        northing += 10_000_000.0
+    return zone, hemi, easting, northing
+
+
+def utm_band(lat: float) -> str:
+    bands = "CDEFGHJKLMNPQRSTUVWX"
+    if -80 <= lat <= 84:
+        idx = min(int((lat + 80) // 8), len(bands) - 1)
+        return bands[idx]
+    return "Z"
+
+
+def utm_to_mgrs(zone: int, lat: float, easting: float, northing: float, precision: int = 5) -> str:
+    band = utm_band(lat)
+    col_set = (zone - 1) % 3
+    col_start = col_set * 8
+    col_idx = int(easting // 100_000) - 1
+    col_idx = max(0, min(7, col_idx))
+    col_letter = MGRS_100K_ALPHA[col_start + col_idx]
+
+    row_cycle = ((zone - 1) % 2) * 5
+    row_num_100k = int((northing % 2_000_000) // 100_000)
+    row_letter = MGRS_100K_V[(row_cycle + row_num_100k) % 20]
+
+    rem_e = easting % 100_000
+    rem_n = northing % 100_000
+    scale = 10 ** (5 - precision)
+    e_str = str(int(rem_e // scale)).zfill(precision)
+    n_str = str(int(rem_n // scale)).zfill(precision)
+    return f"{zone}{band} {col_letter}{row_letter} {e_str} {n_str}"
+
+
+def encode_geohash(lat: float, lon: float, precision: int = 8) -> str:
+    lat_min, lat_max = -90.0, 90.0
+    lon_min, lon_max = -180.0, 180.0
+    gh = []
+    bits = [16, 8, 4, 2, 1]
+    bit = 0
+    ch = 0
+    even = True
+    while len(gh) < precision:
+        if even:
+            mid = (lon_min + lon_max) / 2
+            if lon >= mid:
+                ch |= bits[bit]
+                lon_min = mid
+            else:
+                lon_max = mid
+        else:
+            mid = (lat_min + lat_max) / 2
+            if lat >= mid:
+                ch |= bits[bit]
+                lat_min = mid
+            else:
+                lat_max = mid
+        even = not even
+        if bit < 4:
+            bit += 1
+        else:
+            gh.append(GEOHASH_32[ch])
+            bit = 0
+            ch = 0
+    return "".join(gh)
+
+
+def encode_plus_code(lat: float, lon: float, code_length: int = 10) -> str:
+    lat_val = min(max(lat + 90.0, 0.0), 180.0 - 1e-12)
+    lon_val = ((lon + 180.0) % 360.0)
+
+    resolutions = [20.0, 1.0, 0.05, 0.0025, 0.000125]
+    code = []
+    lat_rem = lat_val
+    lon_rem = lon_val
+
+    pair_steps = min(code_length // 2, 5)
+    for i in range(pair_steps):
+        res = resolutions[i]
+        d_lat = int(lat_rem // res)
+        d_lon = int(lon_rem // res)
+        lat_rem -= d_lat * res
+        lon_rem -= d_lon * res
+        code.append(OLC_ALPHABET[d_lat])
+        code.append(OLC_ALPHABET[d_lon])
+        if len(code) == 8:
+            code.append("+")
+
+    if code_length > 10:
+        grid_lat = 0.000125 / 5.0
+        grid_lon = 0.000125 / 4.0
+        extra = code_length - 10
+        for _ in range(extra):
+            r_idx = min(int(lat_rem // grid_lat), 4)
+            c_idx = min(int(lon_rem // grid_lon), 3)
+            lat_rem -= r_idx * grid_lat
+            lon_rem -= c_idx * grid_lon
+            code.append(OLC_ALPHABET[r_idx * 4 + c_idx])
+            grid_lat /= 5.0
+            grid_lon /= 4.0
+
+    while len(code) < 9:
+        code.append("0")
+    if "+" not in code:
+        code.insert(8, "+")
+    return "".join(code)
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def deg_to_mils(deg: float) -> int:
+    return round((deg * 6400) / 360) % 6400
+
+
+def deg_to_cardinal(deg: float) -> str:
+    dirs = [
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+        "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+    ]
+    return dirs[int((deg + 11.25) / 22.5) % 16]
+
+
+def ensure_uk_airports(max_age_days: int = 7) -> list[dict]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    refresh = True
+    if AIRPORTS_CACHE.exists():
+        age_days = (time.time() - AIRPORTS_CACHE.stat().st_mtime) / 86400
+        if age_days < max_age_days:
+            refresh = False
+
+    if refresh:
+        resp = requests.get(AIRPORTS_URL, timeout=20)
+        resp.raise_for_status()
+        with open(AIRPORTS_CACHE, "w", encoding="utf-8", newline="") as f:
+            f.write(resp.text)
+
+    uk_rows = []
+    with open(AIRPORTS_CACHE, "r", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("iso_country") == "GB" and row.get("type") != "closed":
+                try:
+                    alat = float(row["latitude_deg"])
+                    alon = float(row["longitude_deg"])
+                except (ValueError, KeyError):
+                    continue
+                uk_rows.append({
+                    "icao": (row.get("icao_code") or "").strip().upper(),
+                    "ident": (row.get("ident") or "").strip().upper(),
+                    "name": (row.get("name") or "").strip(),
+                    "type": (row.get("type") or "").strip(),
+                    "elev_ft": (row.get("elevation_ft") or "").strip(),
+                    "lat": alat,
+                    "lon": alon,
+                })
+    return uk_rows
+
+
+def nearest_airfields(lat: float, lon: float, limit: int = 5, require_icao: bool = True) -> list[dict]:
+    airports = ensure_uk_airports()
+    scored = []
+    for ap in airports:
+        code = ap["icao"] or (ap["ident"] if len(ap["ident"]) == 4 else "")
+        if require_icao and not code:
+            continue
+        dist = haversine_km(lat, lon, ap["lat"], ap["lon"])
+        brg = bearing_deg(lat, lon, ap["lat"], ap["lon"])
+        scored.append({
+            **ap,
+            "code": code or ap["ident"],
+            "dist_km": dist,
+            "brg_deg": brg,
+            "brg_mils": deg_to_mils(brg),
+            "cardinal": deg_to_cardinal(brg),
+        })
+    scored.sort(key=lambda x: x["dist_km"])
+    return scored[:limit]
+
+
+def format_report(res: dict, origin: tuple[float, float] | None = None, airfield_count: int = 5) -> str:
+    pc = res.get("postcode", "?")
+    lat = float(res["latitude"])
+    lon = float(res["longitude"])
+    eastings = res.get("eastings")
+    northings = res.get("northings")
+
+    os_6 = bng_to_os_grid(eastings, northings, 6)
+    os_10 = bng_to_os_grid(eastings, northings, 10)
+    zone, hemi, ue, un = latlon_to_utm(lat, lon)
+    mgrs = utm_to_mgrs(zone, lat, ue, un, 5)
+    ghash = encode_geohash(lat, lon, 8)
+    plus = encode_plus_code(lat, lon, 10)
+    elev_m = lookup_elevation(lat, lon)
+    w3w_val = lookup_w3w(lat, lon)
+
+    ward = res.get("admin_ward") or "?"
+    parish = res.get("parish") or "?"
+    district = res.get("admin_district") or "?"
+    pfa = res.get("pfa") or "?"
+    ttwa = res.get("ttwa") or "?"
+    ruc = res.get("ruc21") or res.get("ruc11") or "?"
+
+    lines = [
+        "",
+        f"  TGT AO {pc} W '{ward}' P '{parish}' D '{district}' PFA '{pfa}'",
+        "",
+        f"  > LAT LNG : {lat:.6f} {lon:.6f}",
+        f"  > BNG E+N : {eastings} {northings}",
+        f"  > OS GRID : {os_10 or 'N/A'} ( {os_6 or 'N/A'} )",
+        f"  > UTM     : {zone}{hemi} {ue:.0f}E {un:.0f}N",
+        f"  > MGRS    : {mgrs}",
+        f"  > ALT     : {f'{elev_m:.0f} m ASL' if elev_m is not None else 'N/A'}",
+        f"  > GEOHASH : {ghash}",
+        f"  > PLUS    : {plus}",
+        f"  > TTWA    : '{ttwa}'",
+        f"  > RUC     : '{ruc}'",
+        f"  > W3W     : {w3w_val}",
+    ]
+
+    if origin:
+        dist = haversine_km(origin[0], origin[1], lat, lon)
+        brg = bearing_deg(origin[0], origin[1], lat, lon)
+        lines.append(f"  > FRM REF : {dist:.2f} KM | {brg:.1f} DEG {deg_to_mils(brg)} MIL {deg_to_cardinal(brg)} CAD")
+
+    lines.append("")
+    lines.append("  NEAREST AIRFIELDS")
+    lines.append("")
+    try:
+        aps = nearest_airfields(lat, lon, limit=airfield_count, require_icao=True)
+        for ap in aps:
+            lines.append(
+                f"  > {ap['code']:4s} | {ap['dist_km']:4.1f} KM  | {ap['brg_deg']:5.1f} DEG {ap['brg_mils']:4d} MIL {ap['cardinal']:3s} CAD | {ap['name']}"
+            )
+    except Exception as exc:
+        lines.append(f"  > [!] Airfield lookup issue: {exc}")
+
+    gmaps_url = f"https://www.google.com/maps?q={lat:.6f},{lon:.6f}"
+    mapillary_url = f"https://www.mapillary.com/app/?lat={lat:.6f}&lng={lon:.6f}&z=17"
+    osmaps_url = f"https://explore.osmaps.com/?lat={lat:.6f}&lon={lon:.6f}&zoom=15"
+    trex_url = "https://maps.trex-arms.com/"
+    infra_url = f"https://openinframap.org/#15/{lat:.5f}/{lon:.5f}"
+    cell_url = f"https://www.cellmapper.net/map?MCC=234&MNC=15&type=LTE&latitude={lat:.5f}&longitude={lon:.5f}&zoom=15"
+    overpass_u_url = (
+        f"https://overpass-turbo.eu/?Q={urllib.parse.quote(OVERPASS_U_QUERY)}"
+        f"&C={lat:.5f};{lon:.5f};15&R"
+    )
+    overpass_c_url = (
+        f"https://overpass-turbo.eu/?Q={urllib.parse.quote(OVERPASS_C_QUERY)}"
+        f"&C={lat:.5f};{lon:.5f};15&R"
+    )
+    saunders_url = f"https://sunders.uber.space/?lat={lat:.6f}&lon={lon:.6f}&zoom=17"
+    wigle_url = "https://wigle.net/"
+    ukmesh_url = f"https://app.ukmesh.com/?map={urllib.parse.quote(f'{lat:.5f},{lon:.5f},13.00')}"
+    meshcore_url = f"https://map.meshcore.io/?lat={lat:.6f}&lon={lon:.6f}&zoom=13"
+    nats_zones_url = "https://nats-uk.ead-it.com/cms-nats/opencms/en/uas-restriction-zones/"
+    nats_data_url = "https://nats-uk.ead-it.com/cms-nats/opencms/en/Publications/digital-datasets/"
+
+    lines.append("")
+    lines.append("  TARGET MAPPING")
+    lines.append("")
+    lines.append(f"  > Google Maps | {format_link('https://www.google.com/maps', gmaps_url)}")
+    lines.append(f"  > Mapillary   | {format_link('https://www.mapillary.com/', mapillary_url)}")
+    lines.append(f"  > OS Maps     | {format_link('https://explore.osmaps.com/', osmaps_url)}")
+    lines.append(f"  > T-REX       | {format_link('https://maps.trex-arms.com/', trex_url)}")
+    lines.append(f"  > Local Infra | {format_link('https://openinframap.org/', infra_url)}")
+    lines.append(f"  > Cell Towers | {format_link('https://www.cellmapper.net/map', cell_url)}")
+    lines.append(f"  > Overpass U  | {format_link('https://overpass-turbo.eu/', overpass_u_url)}")
+    lines.append(f"  > Overpass S  | {format_link('https://overpass-turbo.eu/', overpass_c_url)}")
+    lines.append(f"  > Sunders     | {format_link('https://sunders.uber.space/', saunders_url)}")
+    lines.append(f"  > Wigle       | {format_link('https://wigle.net/', wigle_url)}")
+    lines.append(f"  > Mesh Cover  | {format_link('https://app.ukmesh.com/', ukmesh_url)}")
+    lines.append(f"  > Mesh Alt    | {format_link('https://map.meshcore.io/', meshcore_url)}")
+    lines.append(f"  > NATS Zones  | {format_link('https://nats-uk.ead-it.com/', nats_zones_url)}")
+    lines.append(f"  > NATS Data   | {format_link('https://nats-uk.ead-it.com/', nats_data_url)}")
+    return "\n".join(lines)
+
+
+def run_target(raw_pc: str, origin: tuple[float, float] | None, count: int, interactive_tty: bool) -> None:
+    pc = normalise_postcode(raw_pc)
+    res = lookup_postcode(pc)
+    report = format_report(res, origin, count)
+    if interactive_tty:
+        clear_screen()
+        print()
+    print(report)
+    print()
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    origin = None
+    count = 5
+
+    if "--from" in args:
+        idx = args.index("--from")
+        if idx + 1 >= len(args):
+            print("Usage: python3 pcr.py [POSTCODE...] [--from LAT,LON] [--airfields N]", file=sys.stderr)
+            sys.exit(1)
+        olat, olon = map(float, args[idx + 1].split(","))
+        origin = (olat, olon)
+        del args[idx : idx + 2]
+
+    if "--airfields" in args:
+        idx = args.index("--airfields")
+        if idx + 1 >= len(args):
+            sys.exit(1)
+        count = int(args[idx + 1])
+        del args[idx : idx + 2]
+
+    if args:
+        for raw in parse_cli_postcodes(args):
+            try:
+                run_target(raw, origin, count, interactive_tty=False)
+            except Exception as exc:
+                print(f"[!] {exc}", file=sys.stderr)
+        return
+
+    is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+    if not is_tty:
+        for line in sys.stdin:
+            raw = line.strip()
+            if not raw or raw.lower() in {"p", "a"}:
+                continue
+            if raw.lower() in {"e", "q", "quit", "exit"}:
+                break
+            try:
+                run_target(raw, origin, count, interactive_tty=False)
+            except Exception as exc:
+                print(f"[!] {exc}", file=sys.stderr)
+        return
+
+    while True:
+        try:
+            choice = input("\n  > (P)CODE (E)XIT : ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if not choice:
+            continue
+        if choice in {"e", "q", "quit", "exit"}:
+            break
+
+        if choice in {"p", "postcode"}:
+            try:
+                tgt = input("\n  > TGT : ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not tgt:
+                continue
+        else:
+            tgt = choice
+
+        try:
+            run_target(tgt, origin, count, interactive_tty=True)
+        except Exception as exc:
+            print(f"  [!] {exc}")
+            continue
+
+        try:
+            alt = input("  > (A)LT (E)XIT : ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if alt in {"e", "q", "quit", "exit"}:
+            break
+        if alt == "a":
+            clear_screen()
+
+
+if __name__ == "__main__":
+    main()

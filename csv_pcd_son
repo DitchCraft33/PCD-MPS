@@ -1,0 +1,69 @@
+# SRC CSV ... https://data.freemaptools.com/download/full-uk-postcodes/ukpostcodes.zip
+# CONV DB ... python3 csv_pcd_son.py ukpostcodes.csv ~/.cache/ditchcraft_recce/postcodes.json.gz
+
+import csv
+import gzip
+import json
+import re
+import sys
+from pathlib import Path
+
+
+def pick(row: dict, keys: list[str]):
+    for k in keys:
+        if k in row and row[k] not in (None, ""):
+            return row[k]
+    return None
+
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        print("Usage: python3 csv_pc_json.py input.csv output.json[.gz]", file=sys.stderr)
+        sys.exit(1)
+
+    src = Path(sys.argv[1]).expanduser()
+    dst = Path(sys.argv[2]).expanduser()
+    out = []
+
+    with open(src, "r", encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            pc_raw = pick(row, ["postcode", "pcds", "pcd", "Postcode"])
+            if not pc_raw:
+                continue
+            pc_clean = re.sub(r"\s+", "", str(pc_raw).strip().upper())
+            if len(pc_clean) < 5:
+                continue
+            pc_disp = f"{pc_clean[:-3]} {pc_clean[-3:]}"
+
+            lat_v = pick(row, ["lat", "latitude", "Latitude"])
+            lon_v = pick(row, ["lon", "lng", "long", "longitude", "Longitude"])
+            e_v = pick(row, ["eastings", "easting", "oseast1m", "Eastings"])
+            n_v = pick(row, ["northings", "northing", "osnrth1m", "Northings"])
+
+            item = {"postcode": pc_disp}
+            if lat_v is not None and lon_v is not None:
+                try:
+                    item["lat"] = float(lat_v)
+                    item["lon"] = float(lon_v)
+                except ValueError:
+                    pass
+            if e_v is not None and n_v is not None:
+                try:
+                    item["eastings"] = float(e_v)
+                    item["northings"] = float(n_v)
+                except ValueError:
+                    pass
+
+            if "lat" in item or "eastings" in item:
+                out.append(item)
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    opener = gzip.open if dst.suffix == ".gz" else open
+    with opener(dst, "wt", encoding="utf-8") as f:
+        json.dump(out, f, separators=(",", ":"))
+
+    print(f"Wrote {len(out)} postcodes to {dst}")
+
+
+if __name__ == "__main__":
+    main()
