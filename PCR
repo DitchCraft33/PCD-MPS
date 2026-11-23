@@ -506,7 +506,7 @@ def format_report(res: dict, origin: tuple[float, float] | None = None, airfield
         aps = nearest_airfields(lat, lon, limit=airfield_count, require_icao=True)
         for ap in aps:
             lines.append(
-                f"  > {ap['code']:4s} | {ap['dist_km']:4.1f} KM  | {ap['brg_deg']:5.1f} DEG {ap['brg_mils']:4d} MIL {ap['cardinal']:3s} CAD | {ap['name']}"
+                f"  > {ap['code']:4s} | {ap['dist_km']:4.1f} KM  | {ap['brg_deg']:5.1f} DEG {ap['brg_mils']:4d} MIL {ap['cardinal']:3s} CAR | {ap['name']}"
             )
     except Exception as exc:
         lines.append(f"  > [!] Airfield lookup issue: {exc}")
