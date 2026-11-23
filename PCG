@@ -1,4 +1,4 @@
-# SGL TGT ... echo "ts17 0lu" | python3 pcg.py
+# SGL AOI ... echo "ts17 0lu" | python3 pcg.py
 # GD > PC ... echo "NZ 45371 15165" | python3 pcg.py
 # LL > PC ... echo "54.529753,-1.300446" | python3 pcg.py
 # CLI ARG ... python3 pcg.py "ts17 0lu" "NZ 453 151" "54.529753,-1.300446"
